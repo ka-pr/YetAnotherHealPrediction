@@ -1,0 +1,67 @@
+<Ui xmlns="http://www.blizzard.com/wow/ui/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.blizzard.com/wow/ui/
+..\FrameXML\UI.xsd">
+    <Script file="HealPredictionClassic.lua" />
+    <Button name="ClassicHealPredictionColorSwatchTemplate" virtual="true">
+        <Size>
+            <AbsDimension x="16" y="16" />
+        </Size>
+        <Layers>
+            <Layer level="BACKGROUND">
+                <Texture name="$parentBackground">
+                    <Size>
+                        <AbsDimension x="14" y="14" />
+                    </Size>
+                    <Anchors>
+                        <Anchor point="CENTER"/>
+                    </Anchors>
+                    <Color r="1.0" g="1.0" b="1.0" />
+                </Texture>
+            </Layer>
+        </Layers>
+        <Scripts>
+            <OnEnter>
+                getglobal(self:GetName() .. "Background"):SetVertexColor(1.0, 0.82, 0.0)
+            </OnEnter>
+            <OnLeave>
+                getglobal(self:GetName() .. "Background"):SetVertexColor(1.0, 1.0, 1.0)
+            </OnLeave>
+        </Scripts>
+        <NormalTexture name="$parentColor" file="Interface\ChatFrame\ChatFrameColorSwatch" />
+    </Button>
+    <Slider name="ClassicHealPredictionOptionsSliderTemplate" inherits="HorizontalSliderTemplate" virtual="true">
+        <Size x="144" y="17"/>
+        <Layers>
+            <Layer level="ARTWORK">
+                <FontString name="$parentText" inherits="OptionsFontHighlight">
+                    <Anchors>
+                        <Anchor point="BOTTOM" relativePoint="TOP"/>
+                    </Anchors>
+                </FontString>
+                <FontString name="$parentLow" inherits="OptionsFontSmall" text="LOW">
+                    <Anchors>
+                        <Anchor point="TOPLEFT" relativePoint="BOTTOMLEFT">
+                            <Offset>
+                                <AbsDimension x="-4" y="3"/>
+                            </Offset>
+                        </Anchor>
+                    </Anchors>
+                </FontString>
+                <FontString name="$parentHigh" inherits="OptionsFontSmall" text="HIGH">
+                    <Anchors>
+                        <Anchor point="TOPRIGHT" relativePoint="BOTTOMRIGHT">
+                            <Offset>
+                                <AbsDimension x="4" y="3"/>
+                            </Offset>
+                        </Anchor>
+                    </Anchors>
+                </FontString>
+            </Layer>
+        </Layers>
+    </Slider>
+    <Frame name="ClassicHealPredictionFrame">
+        <Scripts>
+            <OnLoad function="ClassicHealPredictionFrame_OnLoad" />
+            <OnEvent function="ClassicHealPredictionFrame_OnEvent" />
+        </Scripts>
+    </Frame>
+</Ui>
