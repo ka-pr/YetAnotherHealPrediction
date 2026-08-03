@@ -1,5 +1,51 @@
-local ADDON_NAME = ...
-local ADDON_VERSION = string.match(GetAddOnMetadata(ADDON_NAME, "Version"), "^v(%d+%.%d+%.%d+)$")
+-- KNOWN ISSUE (not fixed here - Blizzard bug in a bundled third-party library,
+-- not this addon's code, tracked here purely for documentation):
+--
+-- Symptom: while Edit Mode is open, casting/receiving Power Word: Shield (and
+-- presumably other aura-name-driven combat log activity) spams BugSack with
+-- "Blizzard_FrameXMLUtil/AuraUtil.lua:25: attempt to call a nil value"
+-- (methodName="GetAuraDataBySpellName"). Also reproducible by hovering a
+-- buff/debuff icon whose screen position happens to overlap one of Edit
+-- Mode's dummy preview icons, which surfaces the real aura's tooltip.
+--
+-- Root cause: Blizzard_EditMode/Shared/EditModeManager.lua's EnterEditMode()
+-- calls AuraUtil.SetDataProvider(GetEditModeAuraDataProvider()), swapping
+-- AuraUtil's data source to a small mock object (Blizzard_EditMode/Shared/
+-- EditModeAuraDataProvider.lua) that only implements GetAuraSlots,
+-- GetAuraDataBySlot and GetAuraDataByAuraInstanceID - not
+-- GetAuraDataBySpellName. This addon's bundled libs/LibHealComm-4.0/
+-- LibHealComm-4.0.lua calls AuraUtil.FindAuraByName (via its own local
+-- unitHasAura(unit, name) helper, LibHealComm-4.0.lua:794-800) from inside
+-- HealComm:COMBAT_LOG_EVENT_UNFILTERED (LibHealComm-4.0.lua:2871) on every
+-- relevant combat log event for a tracked unit, which crashes while that mock
+-- provider is active. ExitEditMode() calls AuraUtil.ClearDataProvider() to
+-- restore the real C_UnitAuras provider, so this is scoped entirely to Edit
+-- Mode being open - confirmed via C_UnitAuras itself being fully intact
+-- in-game (GetAuraDataBySpellName included) once Edit Mode is closed.
+--
+-- Not patched: purely cosmetic (BugSack noise while previewing frame layout
+-- in Edit Mode, a non-gameplay UI state), no effect on heal prediction or
+-- absorb display during normal play, and the bug is in Blizzard's own mock
+-- object plus bundled/vendored LibHealComm-4.0 - not this addon's own code.
+--
+-- FIXME
+--
+-- ORIGINAL: GetAddOnMetadata (was a global var before) no longer exists in the
+-- shared Retail/Classic UI codebase - calling it threw "attempt to call a nil value" on the
+-- second line of this file, which silently killed the entire rest of the file on load
+-- (nothing after this poYint ever ran), except if some other addon happened to shim
+-- the old global back in (probably an addon alphabetically before Heal... due to load order).
+--
+-- local ADDON_NAME = ...
+-- local ADDON_VERSION = string.match(GetAddOnMetadata(ADDON_NAME, "Version"), "^v(%d+%.%d+%.%d+)$")
+local ADDON_NAME, _ = ...
+local GetAddOnMetadata = C_AddOns and C_AddOns.GetAddOnMetadata or GetAddOnMetadata
+local metaData = GetAddOnMetadata(ADDON_NAME, "Version")
+local ADDON_VERSION = string.match(metaData or "", "^v(%d+%.%d+%.%d+)$")
+if not ADDON_VERSION then
+    ADDON_VERSION = "Local Dev Build"
+end
+ChatFrame1:AddMessage("Loading " .. ADDON_NAME .. "(" .. ADDON_VERSION .. ")" .. " test version for WoW Classic Era Patch 1.15.9.", 0.85, 0.82, 0.0)
 
 local HealComm = LibStub("LibHealComm-4.0")
 local HealComm_OVERTIME_HEALS = bit.bor(HealComm.HOT_HEALS, HealComm.CHANNEL_HEALS)
@@ -263,6 +309,38 @@ local function createTexture(frame, name, layer, subLayer)
     return getTexture(frame, name) or frame:CreateTexture(name, layer, nil, subLayer)
 end
 
+-- ORIGINAL: Added two helper functions, they didn't exist before; every caller below used to
+-- call :ClearAllPoints()/:SetTexture()/:SetVertexColor() directly on the bar.
+-- Some bar regions this addon expects to be plain Textures (identified by name,
+-- e.g. "$parentMyHealPredictionBar") now resolve, via getTexture() above, to
+-- Blizzard's own native generic StatusBarOverlaySegmentMixin-based frames instead (also impemented
+-- for PlayerFrame/PetFrame in the shared Retail/Classic UI codebase).
+-- Blizzard's own source comment on `Shared/StatusBarOverlaySegment.lua`:
+-- "A segment of fill that displays on top of a status bar. Ex: Heal prediction bar,
+-- which displays on top of a unit's health bar."
+-- Blizzard has now standardized overlay bars into a shared widget type used by both their
+-- own native heal-prediction and, as a side effect, by anything else that resolves to one of
+-- these objects by name
+-- Scope: we are now able to resolve to blizzard overlays in Individual unit frames (PlayerFrame,
+-- PetFrame, TargetFrame, party-member frames) within this addon's 2-tier system of heal/overheal,
+-- heal absorb and total absorb
+-- For Compact/raid frames and nameplates Blizzard's API seems to provide nothing, so we still
+-- have to manipulate self-created textures
+local function setFillTexture(texture, path)
+    if texture.SetTexture then
+        texture:ClearAllPoints()
+        texture:SetTexture(path)
+    end
+end
+
+local function setFillVertexColor(texture, r, g, b, a)
+    if texture.SetVertexColor then
+        texture:SetVertexColor(r, g, b, a)
+    elseif texture.Fill then
+        texture.Fill:SetVertexColor(r, g, b, a)
+    end
+end
+
 local function deepcopy(orig)
     local orig_type = type(orig)
     local copy
@@ -297,9 +375,14 @@ end
 
 local weaktable = {__mode = "k"}
 local healthBar = setmetatable({}, weaktable)
+-- ORIGINAL 
+-- myHealPrediction[someFrame] is the myHealPrediction bar belonging to some frame
 local myHealPrediction = setmetatable({}, weaktable)
+-- table that maps frame -> textures for my overheals (it's like a 2-tier bar system with heals and overheals)
 local myHealPrediction2 = setmetatable({}, weaktable)
+-- table that maps frame -> textures for others' heals
 local otherHealPrediction = setmetatable({}, weaktable)
+-- these are again the overheal bars or textures for others in the 2-tier bar/texture system (these are all dicts in case you didn't notice)
 local otherHealPrediction2 = setmetatable({}, weaktable)
 local healAbsorb = setmetatable({}, weaktable)
 local overHealAbsorbGlow = setmetatable({}, weaktable)
@@ -371,11 +454,19 @@ local function updateHealPrediction(frame, unit, cutoff, gradient, colorPalette,
     if healAbsorb then
         currentHealAbsorb = 0
 
-        if health < currentHealAbsorb then
-            overHealAbsorbGlow[frame]:Show()
-            currentHealAbsorb = health
-        else
-            overHealAbsorbGlow[frame]:Hide()
+        -- ORIGINAL: unconditional overHealAbsorbGlow[frame]:Show()/Hide(), no guard.
+        -- Default party member frames set healAbsorb[frame] (memberHealthBar.HealAbsorbBar
+        -- exists) but memberHealthBar.OverHealAbsorbGlow does not - initPartyMemberFrame's
+        -- own "if memberHealthBar.OverHealAbsorbGlow then" guard already anticipates this,
+        -- but left overHealAbsorbGlow[frame] nil for that frame, which crashed here since
+        -- this code always assumed it would be set whenever healAbsorb[frame] was.
+        if overHealAbsorbGlow[frame] then
+            if health < currentHealAbsorb then
+                overHealAbsorbGlow[frame]:Show()
+                currentHealAbsorb = health
+            else
+                overHealAbsorbGlow[frame]:Hide()
+            end
         end
     end
 
@@ -390,13 +481,18 @@ local function updateHealPrediction(frame, unit, cutoff, gradient, colorPalette,
     end
 
     local colors = ClassicHealPredictionSettings.colors
-
+	-- Normal incoming heals, either a native Blizzard overlay segment (for Player, Pet, Target,
+    -- party-member frames ) or a plain self-drawn (i.e. by this addon) texture (for compact/raid frames
+    --  and nameplates)
     local myHealPrediction1 = myHealPrediction[frame]
+	-- Incoming overheals (in a different color?)
     local myHealPrediction2 = myHealPrediction2[frame]
+    -- The same as above other the heals and overheals of others
     local otherHealPrediction1 = otherHealPrediction[frame]
     local otherHealPrediction2 = otherHealPrediction2[frame]
 
     if gradient then
+		-- This concerns Raid and compact party frames (raid style party frames) and player pet frames
         local r, g, b, a, r2, g2, b2
 
         r, g, b, a, r2, g2, b2 = unpack(colors[colorPalette[1]])
@@ -431,6 +527,16 @@ local function updateHealPrediction(frame, unit, cutoff, gradient, colorPalette,
             otherHealPrediction2:SetGradient("VERTICAL", getColor(r2, g2, b2, a), getColor(r, g, b, a))
         end
     else
+		-- ... gradient is false: player/target/pet frame/party frames (non raid style) and name plates
+        -- ORIGINAL: these 4 branches called myHealPrediction1:SetVertexColor(...),
+        -- myHealPrediction2:SetVertexColor(...), otherHealPrediction1:SetVertexColor(...),
+        -- otherHealPrediction2:SetVertexColor(...) directly. On PlayerFrame/PetFrame/
+        -- party/target frames.
+        -- myHealPrediction1/otherHealPrediction1 are now Blizzard's StatusBarOverlaySegment
+        -- objects (see setFillVertexColor above) which have no SetVertexColor of their
+        -- own, so those two calls threw "attempt to call a nil value". myHealPrediction2/
+        -- otherHealPrediction2 (the addon's own "2" overflow-color bars) have no Blizzard
+        -- name collision and remain plain Textures, so those two calls were already fine
         local r, g, b, a
 
         r, g, b, a = unpack(colors[colorPalette[1]])
@@ -438,7 +544,7 @@ local function updateHealPrediction(frame, unit, cutoff, gradient, colorPalette,
         if a == 0 then
             myIncomingHeal1 = 0
         else
-            myHealPrediction1:SetVertexColor(r, g, b, a)
+            setFillVertexColor(myHealPrediction1, r, g, b, a)
         end
 
         r, g, b, a = unpack(colors[colorPalette[2]])
@@ -446,7 +552,7 @@ local function updateHealPrediction(frame, unit, cutoff, gradient, colorPalette,
         if a == 0 then
             myIncomingHeal2 = 0
         else
-            myHealPrediction2:SetVertexColor(r, g, b, a)
+            setFillVertexColor(myHealPrediction2, r, g, b, a)
         end
 
         r, g, b, a = unpack(colors[colorPalette[3]])
@@ -454,7 +560,7 @@ local function updateHealPrediction(frame, unit, cutoff, gradient, colorPalette,
         if a == 0 then
             otherIncomingHeal1 = 0
         else
-            otherHealPrediction1:SetVertexColor(r, g, b, a)
+            setFillVertexColor(otherHealPrediction1, r, g, b, a)
         end
 
         r, g, b, a = unpack(colors[colorPalette[4]])
@@ -462,7 +568,7 @@ local function updateHealPrediction(frame, unit, cutoff, gradient, colorPalette,
         if a == 0 then
             otherIncomingHeal2 = 0
         else
-            otherHealPrediction2:SetVertexColor(r, g, b, a)
+            setFillVertexColor(otherHealPrediction2, r, g, b, a)
         end
     end
 
@@ -506,10 +612,15 @@ local function updateHealPrediction(frame, unit, cutoff, gradient, colorPalette,
         end
     end
 
-    if overAbsorb then
-        overAbsorbGlow[frame]:Show()
-    else
-        overAbsorbGlow[frame]:Hide()
+    -- ORIGINAL: unconditional overAbsorbGlow[frame]:Show()/Hide(), no guard - same
+    -- rationale as overHealAbsorbGlow above (default party frames may not have
+    -- memberHealthBar.OverAbsorbGlow, per initPartyMemberFrame's own guard).
+    if overAbsorbGlow[frame] then
+        if overAbsorb then
+            overAbsorbGlow[frame]:Show()
+        else
+            overAbsorbGlow[frame]:Hide()
+        end
     end
 
     local healthTexture = healthBar[frame]:GetStatusBarTexture()
@@ -562,6 +673,55 @@ end
 local CompactUnitFrame_UpdateHealPrediction
 local UnitFrameHealPredictionBars_Update
 
+-- ORIGINAL: this function did not exist; UnitFrameHealPredictionBars_Update
+-- (below) passed the bare global UnitFrameUtil_UpdateFillBar directly as its
+-- updateFillBar callback instead of unitFrameHealPredictionBar_UpdateFillPosition.
+-- On PlayerFrame/PetFrame/TargetFrame etc. (unlike CompactUnitFrame-style raid/party
+-- frames, which still use plain Textures here), the individual heal-prediction bars
+-- are now Blizzard's own StatusBarOverlaySegmentMixin-based frames, positioned via
+-- :UpdateFillPosition() instead of manual SetPoint/SetWidth. We can't confirm
+-- Blizzard's own UnitFrameUtil_UpdateFillBar still exists or still supports the old
+-- calling convention, so this reimplements its contract directly: dispatch to
+-- UpdateFillPosition when available, otherwise fall back to the same manual
+-- positioning Blizzard's (confirmed still current) CompactUnitFrameUtil_UpdateFillBar
+-- uses, in case a given bar is still a plain Texture.
+local function unitFrameHealPredictionBar_UpdateFillPosition(frame, previousTexture, bar, amount, barOffsetXPercent)
+    if bar.UpdateFillPosition then
+        local result = bar:UpdateFillPosition(previousTexture, amount, barOffsetXPercent)
+        return result
+    end
+
+    local totalWidth = healthBar[frame]:GetWidth()
+
+    if totalWidth == 0 or amount == 0 then
+        bar:Hide()
+
+        if bar.overlay then
+            bar.overlay:Hide()
+        end
+
+        return previousTexture
+    end
+
+    local barOffsetX = barOffsetXPercent and totalWidth * barOffsetXPercent or 0
+
+    bar:ClearAllPoints()
+    bar:SetPoint("TOPLEFT", previousTexture, "TOPRIGHT", barOffsetX, 0)
+    bar:SetPoint("BOTTOMLEFT", previousTexture, "BOTTOMRIGHT", barOffsetX, 0)
+
+    local _, totalMax = healthBar[frame]:GetMinMaxValues()
+    local barSize = (amount / totalMax) * totalWidth
+
+    bar:SetWidth(barSize)
+    bar:Show()
+
+    if bar.overlay then
+        bar.overlay:Show()
+    end
+
+    return bar
+end
+
 do
     local compactUnitFrameColorPalette = {1, 2, 5, 6}
     local compactUnitFrameColorPalette2 = {3, 4, 7, 8}
@@ -587,7 +747,9 @@ do
             cutoff = 1.0 + maxOverflow
         end
 
-        updateHealPrediction(frame, frame.unit, cutoff, false, unitFrameColorPalette, unitFrameColorPalette2, UnitFrameUtil_UpdateFillBar)
+        -- ORIGINAL: updateHealPrediction(..., UnitFrameUtil_UpdateFillBar) - see the
+        -- unitFrameHealPredictionBar_UpdateFillPosition comment above for why.
+        updateHealPrediction(frame, frame.unit, cutoff, false, unitFrameColorPalette, unitFrameColorPalette2, unitFrameHealPredictionBar_UpdateFillPosition)
     end
 end
 
@@ -605,6 +767,36 @@ local function defer_UnitFrameHealPredictionBars_Update(frame)
     else
         UnitFrameHealPredictionBars_Update(frame)
     end
+end
+
+-- ORIGINAL: this function did not exist; unitFrameManaCostPredictionBars_Update
+-- below called frame.myManaCostPredictionBar:SetVertexColor(...) directly and
+-- passed the bare global UnitFrameUtil_UpdateManaFillBar as the fill-position call.
+-- Mirrors unitFrameHealPredictionBar_UpdateFillPosition above for the mana-cost
+-- prediction bar: dispatch to UpdateFillPosition when the bar is Blizzard's new
+-- StatusBarOverlaySegment type, otherwise fall back to the same manual anchoring
+-- pattern (anchored off the mana bar's current fill edge, no X offset needed since
+-- there is only ever one segment here).
+local function unitFrameManaCostPredictionBar_UpdateFillPosition(frame, previousTexture, bar, amount)
+    if bar.UpdateFillPosition then
+        return bar:UpdateFillPosition(previousTexture, amount)
+    end
+
+    local totalWidth = frame.manabar:GetWidth()
+
+    if totalWidth == 0 or amount == 0 then
+        bar:Hide()
+        return
+    end
+
+    local _, totalMax = frame.manabar:GetMinMaxValues()
+    local barSize = (amount / totalMax) * totalWidth
+
+    bar:ClearAllPoints()
+    bar:SetPoint("TOPLEFT", previousTexture, "TOPRIGHT", 0, 0)
+    bar:SetPoint("BOTTOMLEFT", previousTexture, "BOTTOMRIGHT", 0, 0)
+    bar:SetWidth(barSize)
+    bar:Show()
 end
 
 local function unitFrameManaCostPredictionBars_Update(frame, isStarting, startTime, endTime, spellID)
@@ -642,11 +834,18 @@ local function unitFrameManaCostPredictionBars_Update(frame, isStarting, startTi
 
     local manaBarTexture = frame.manabar:GetStatusBarTexture()
 
+    -- ORIGINAL:
+    -- local r, g, b, a = unpack(ClassicHealPredictionSettings.colors[17])
+    -- frame.myManaCostPredictionBar:SetVertexColor(r, g, b, a)
+    --
+    -- UnitFrameManaBar_Update(frame.manabar, "player")
+    -- UnitFrameUtil_UpdateManaFillBar(frame, manaBarTexture, frame.myManaCostPredictionBar, cost)
     local r, g, b, a = unpack(ClassicHealPredictionSettings.colors[17])
-    frame.myManaCostPredictionBar:SetVertexColor(r, g, b, a)
+    setFillVertexColor(frame.myManaCostPredictionBar, r, g, b, a)
 
     UnitFrameManaBar_Update(frame.manabar, "player")
-    UnitFrameUtil_UpdateManaFillBar(frame, manaBarTexture, frame.myManaCostPredictionBar, cost)
+
+    unitFrameManaCostPredictionBar_UpdateFillPosition(frame, manaBarTexture, frame.myManaCostPredictionBar, cost)
 end
 
 local function UnitFrameHealPredictionBars_UpdateSize(self)
@@ -657,14 +856,26 @@ local function UnitFrameHealPredictionBars_UpdateSize(self)
     defer_UnitFrameHealPredictionBars_Update(self)
 end
 
-hooksecurefunc(
-    "CompactUnitFrame_UpdateUnitEvents",
-    function(frame)
-        if not frame:IsForbidden() then
-            frame:UnregisterEvent("UNIT_HEALTH")
-        end
-    end
-)
+-- ORIGINAL (pre shared Retail/Classic UI codebase rewrite): unregistered UNIT_HEALTH
+-- on every compact frame right after Blizzard registered it. Traced via upstream
+-- ClassicHealPrediction history to leftover code from a removed 2019 "animated
+-- health-loss bar" feature - harmless for years since the old client treated
+-- UNIT_HEALTH and UNIT_HEALTH_FREQUENT as interchangeable refresh triggers, so
+-- this addon's own UNIT_HEALTH_FREQUENT-driven refresh (below) covered for it.
+-- 1.15.9 narrowed that: CompactUnitFrame_SetHealthDirty (the real health value
+-- redraw) now only fires from UNIT_HEALTH, while SetHealPredictionDirty still
+-- fires from both (confirmed via diagnostic logging) - so this stale unregister
+-- call silently cut off the real health bar while prediction kept working,
+-- matching the exact symptom reported. Disabled.
+--
+-- hooksecurefunc(
+--     "CompactUnitFrame_UpdateUnitEvents",
+--     function(frame)
+--         if not frame:IsForbidden() then
+--             frame:UnregisterEvent("UNIT_HEALTH")
+--         end
+--     end
+-- )
 
 hooksecurefunc(
     "CompactUnitFrame_OnEvent",
@@ -717,7 +928,117 @@ hooksecurefunc("CompactUnitFrame_UpdateHealth", defer_CompactUnitFrame_UpdateHea
 
 hooksecurefunc("CompactUnitFrame_UpdateMaxHealth", defer_CompactUnitFrame_UpdateHealPrediction)
 
+-- ORIGINAL: this hook did not exist.
+-- Belt-and-suspenders fix for the same symptom as the UNIT_HEALTH UnregisterEvent
+-- hook below (see "ORIGINAL (pre shared Retail/Classic UI codebase rewrite)" further down): with
+-- UNIT_HEALTH unregistered on compact frames, CompactUnitFrame_SetHealthDirty
+-- never fired on plain damage/healing while CompactUnitFrame_SetHealPredictionDirty
+-- kept firing reliably (confirmed via diagnostic logging), so the health bar's
+-- value never refreshed while heal prediction kept working - matching the exact
+-- symptom reported. Piggyback the missing call onto the one that does fire
+-- reliably. Now that the actual UnregisterEvent("UNIT_HEALTH") call has been
+-- disabled, Blizzard's own SetHealthDirty call should fire on its own again,
+-- making this redundant (but harmless - the flag is idempotent) unless something
+-- else is still suppressing it.
+if CompactUnitFrame_SetHealPredictionDirty and CompactUnitFrame_SetHealthDirty then
+    hooksecurefunc("CompactUnitFrame_SetHealPredictionDirty", function(frame)
+        CompactUnitFrame_SetHealthDirty(frame)
+    end)
+end
+
+-- ORIGINAL: this function did not exist. Party member frames (the "old default",
+-- non-raid-style party display, PartyMemberFrameTemplate) are a new gap uncovered
+-- after the fact: initUnitFrame's global-name-based createTexture/getChild lookup
+-- doesn't work here at all, since these frames come from a frame pool and are
+-- unnamed - every party member slot shares the same nearest-named-ancestor
+-- (PartyFrame), so createTexture's "$parent"-substituted global name would
+-- collide across all 4 slots for anything that has to be created fresh (the "2"
+-- tier bars, shadow/glow textures). Unlike initUnitFrame, this populates the
+-- heal-prediction tables directly from Blizzard's real child objects (confirmed
+-- via PartyFrameTemplates.xml: HealthBarContainer.HealthBar.MyHealPredictionBar/
+-- OtherHealPredictionBar/HealAbsorbBar/TotalAbsorbBar are the same
+-- StatusBarOverlaySegment-based bars PlayerFrame uses), and only creates new
+-- (anonymously-named, collision-free) textures for the parts Blizzard doesn't
+-- provide natively. Hooked from unitFrame_Update below rather than needing a new
+-- hook, since UnitFrame_SetUnit (already hooked into unitFrame_Update) already
+-- fires for these frames on its own. Party member pet mini-icons are not covered -
+-- Blizzard's PartyMemberPetFrameTemplate has no equivalent bar structure at all,
+-- so supporting those would mean building everything from scratch; deferred.
+local function initPartyMemberFrame(frame)
+    -- ORIGINAL: this guard checked "frame.HealthBarContainer and
+    -- frame.HealthBarContainer.HealthBar" - based on reference-repo research that
+    -- turned out not to match the live default party frame structure. Diagnostic
+    -- logging confirmed frame.HealthBarContainer is nil on the real frame, and the
+    -- health bar is actually frame.healthbar directly (the same lowercase, flat
+    -- convention this file already uses for Player/Pet/Target frames), with
+    -- MyHealPredictionBar etc. as direct children of that.
+    if not frame or myHealPrediction[frame] or not frame.healthbar then
+        return
+    end
+
+    local memberHealthBar = frame.healthbar
+
+    if not (memberHealthBar.MyHealPredictionBar and memberHealthBar.OtherHealPredictionBar
+        and memberHealthBar.HealAbsorbBar and memberHealthBar.TotalAbsorbBar) then
+        return
+    end
+
+    healthBar[frame] = memberHealthBar
+    myHealPrediction[frame] = memberHealthBar.MyHealPredictionBar
+    otherHealPrediction[frame] = memberHealthBar.OtherHealPredictionBar
+    healAbsorb[frame] = memberHealthBar.HealAbsorbBar
+    totalAbsorb[frame] = memberHealthBar.TotalAbsorbBar
+
+    -- No Blizzard-native equivalent for these; create our own the same
+    -- collision-free (nil-named) way defaultCompactUnitFrameSetup/
+    -- namePlateApplyFrameOptions already do for their own pooled/unnamed frames.
+    myHealPrediction2[frame] = createTexture(memberHealthBar, nil, "BORDER", 5)
+    setFillTexture(myHealPrediction2[frame], "Interface/TargetingFrame/UI-TargetingFrame-BarFill")
+
+    otherHealPrediction2[frame] = createTexture(memberHealthBar, nil, "BORDER", 5)
+    setFillTexture(otherHealPrediction2[frame], "Interface/TargetingFrame/UI-TargetingFrame-BarFill")
+
+    healAbsorbLeftShadow[frame] = createTexture(memberHealthBar, nil, "ARTWORK", 1)
+    setFillTexture(healAbsorbLeftShadow[frame], "Interface\\RaidFrame\\Absorb-Edge")
+
+    healAbsorbRightShadow[frame] = createTexture(memberHealthBar, nil, "ARTWORK", 1)
+    setFillTexture(healAbsorbRightShadow[frame], "Interface\\RaidFrame\\Absorb-Edge")
+    healAbsorbRightShadow[frame]:SetTexCoord(1, 0, 0, 1)
+
+    -- OverAbsorbGlow/OverHealAbsorbGlow ARE provided natively here (confirmed
+    -- plain Textures, same OverAbsorbGlowTemplate/OverHealAbsorbGlowTemplate as
+    -- PlayerFrame) - direct field access is safe (per-instance, not name-based),
+    -- so reuse Blizzard's objects and restyle them the same way initUnitFrame does.
+    if memberHealthBar.OverAbsorbGlow then
+        overAbsorbGlow[frame] = memberHealthBar.OverAbsorbGlow
+        overAbsorbGlow[frame]:ClearAllPoints()
+        overAbsorbGlow[frame]:SetTexture("Interface\\RaidFrame\\Shield-Overshield")
+        overAbsorbGlow[frame]:SetBlendMode("ADD")
+        overAbsorbGlow[frame]:SetPoint("BOTTOMLEFT", memberHealthBar, "BOTTOMRIGHT", -7, 0)
+        overAbsorbGlow[frame]:SetPoint("TOPLEFT", memberHealthBar, "TOPRIGHT", -7, 0)
+        overAbsorbGlow[frame]:SetWidth(16)
+        -- ORIGINAL: no Hide() call here - restyling a reused Blizzard object is not
+        -- guaranteed to leave it in a hidden state, so force it, same rationale as
+        -- the freshly created textures elsewhere.
+        overAbsorbGlow[frame]:Hide()
+    end
+
+    if memberHealthBar.OverHealAbsorbGlow then
+        overHealAbsorbGlow[frame] = memberHealthBar.OverHealAbsorbGlow
+        overHealAbsorbGlow[frame]:ClearAllPoints()
+        overHealAbsorbGlow[frame]:SetTexture("Interface\\RaidFrame\\Absorb-Overabsorb")
+        overHealAbsorbGlow[frame]:SetBlendMode("ADD")
+        overHealAbsorbGlow[frame]:SetPoint("BOTTOMRIGHT", memberHealthBar, "BOTTOMLEFT", 7, 0)
+        overHealAbsorbGlow[frame]:SetPoint("TOPRIGHT", memberHealthBar, "TOPLEFT", 7, 0)
+        overHealAbsorbGlow[frame]:SetWidth(16)
+        -- ORIGINAL: no Hide() call here - same rationale as overAbsorbGlow above.
+        overHealAbsorbGlow[frame]:Hide()
+    end
+end
+
 local function unitFrame_Update(self)
+    initPartyMemberFrame(self)
+
     do
         local unit = self.unit
         local unitGUID = currUnitGUID[self]
@@ -768,7 +1089,15 @@ hooksecurefunc(
     function(self)
         if not self.disconnected and not self.lockValues then
             if not self.ignoreNoUnit or UnitGUID(self.unit) then
-                defer_UnitFrameHealPredictionBars_Update(self:GetParent())
+                local parent = self:GetParent()
+                -- ORIGINAL: this call did not exist. unitFrame_Update (which calls
+                -- initPartyMemberFrame) never actually fires for default party member
+                -- frames in the shared Retail/Classic UI codebase - only this lower-level
+                -- health-bar-specific hook reliably does - so setup is invoked from here
+                -- too. initPartyMemberFrame no-ops immediately once already set up, so
+                -- this is safe to call on every tick.
+                initPartyMemberFrame(parent)
+                defer_UnitFrameHealPredictionBars_Update(parent)
             end
         end
     end
@@ -781,7 +1110,11 @@ hooksecurefunc(
             return
         end
 
-        defer_UnitFrameHealPredictionBars_Update(statusbar:GetParent())
+        local parent = statusbar:GetParent()
+        -- ORIGINAL: this call did not exist - see the matching comment on
+        -- UnitFrameHealthBar_OnUpdate's hook above for why.
+        initPartyMemberFrame(parent)
+        defer_UnitFrameHealPredictionBars_Update(parent)
     end
 )
 
@@ -940,9 +1273,14 @@ do
         otherHealPrediction2[frame]:ClearAllPoints()
         otherHealPrediction2[frame]:SetColorTexture(1, 1, 1)
 
+        -- ORIGINAL (DRY cleanup, not a bug fix - these frames are confirmed always
+        -- plain Textures, never StatusBarOverlaySegment, so setFillTexture's guard
+        -- is a no-op here; routed through it anyway to match the rest of the file
+        -- instead of repeating ClearAllPoints()/SetTexture() by hand):
+        -- totalAbsorb[frame]:ClearAllPoints()
+        -- totalAbsorb[frame]:SetTexture("Interface\\RaidFrame\\Shield-Fill")
         totalAbsorb[frame] = createTexture(frame, "$parentTotalAbsorb", "BORDER", 5)
-        totalAbsorb[frame]:ClearAllPoints()
-        totalAbsorb[frame]:SetTexture("Interface\\RaidFrame\\Shield-Fill")
+        setFillTexture(totalAbsorb[frame], "Interface\\RaidFrame\\Shield-Fill")
 
         totalAbsorbOverlay[frame] = createTexture(frame, "$parentTotalAbsorbOverlay", "BORDER", 6)
         totalAbsorb[frame].overlay = totalAbsorbOverlay[frame]
@@ -954,13 +1292,18 @@ do
         healAbsorb[frame]:ClearAllPoints()
         healAbsorb[frame]:SetTexture("Interface\\RaidFrame\\Absorb-Fill", true, true)
 
+        -- ORIGINAL (DRY cleanup, same rationale as totalAbsorb above):
+        -- healAbsorbLeftShadow[frame]:ClearAllPoints()
+        -- healAbsorbLeftShadow[frame]:SetTexture("Interface\\RaidFrame\\Absorb-Edge")
         healAbsorbLeftShadow[frame] = createTexture(frame, "$parentMyHealAbsorbLeftShadow", "ARTWORK", 1)
-        healAbsorbLeftShadow[frame]:ClearAllPoints()
-        healAbsorbLeftShadow[frame]:SetTexture("Interface\\RaidFrame\\Absorb-Edge")
+        setFillTexture(healAbsorbLeftShadow[frame], "Interface\\RaidFrame\\Absorb-Edge")
 
+        -- ORIGINAL (DRY cleanup for the ClearAllPoints/SetTexture pair only;
+        -- SetTexCoord is unrelated to setFillTexture and stays a direct call):
+        -- healAbsorbRightShadow[frame]:ClearAllPoints()
+        -- healAbsorbRightShadow[frame]:SetTexture("Interface\\RaidFrame\\Absorb-Edge")
         healAbsorbRightShadow[frame] = createTexture(frame, "$parentMyHealAbsorbRightShadow", "ARTWORK", 1)
-        healAbsorbRightShadow[frame]:ClearAllPoints()
-        healAbsorbRightShadow[frame]:SetTexture("Interface\\RaidFrame\\Absorb-Edge")
+        setFillTexture(healAbsorbRightShadow[frame], "Interface\\RaidFrame\\Absorb-Edge")
         healAbsorbRightShadow[frame]:SetTexCoord(1, 0, 0, 1)
 
         overAbsorbGlow[frame] = createTexture(frame, "$parentOverAbsorbGlow", "ARTWORK", 2)
@@ -970,6 +1313,10 @@ do
         overAbsorbGlow[frame]:SetPoint("BOTTOMLEFT", healthBar[frame], "BOTTOMRIGHT", -7, 0)
         overAbsorbGlow[frame]:SetPoint("TOPLEFT", healthBar[frame], "TOPRIGHT", -7, 0)
         overAbsorbGlow[frame]:SetWidth(16)
+        -- ORIGINAL: no Hide() call here - a freshly created texture defaults to
+        -- shown once SetTexture is called, so this glow was visible until the
+        -- first updateHealPrediction pass for this frame explicitly hid it.
+        overAbsorbGlow[frame]:Hide()
 
         overHealAbsorbGlow[frame] = createTexture(frame, "$parentOverHealAbsorbGlow", "ARTWORK", 2)
         overHealAbsorbGlow[frame]:ClearAllPoints()
@@ -978,6 +1325,8 @@ do
         overHealAbsorbGlow[frame]:SetPoint("BOTTOMRIGHT", healthBar[frame], "BOTTOMLEFT", 7, 0)
         overHealAbsorbGlow[frame]:SetPoint("TOPRIGHT", healthBar[frame], "TOPLEFT", 7, 0)
         overHealAbsorbGlow[frame]:SetWidth(16)
+        -- ORIGINAL: no Hide() call here - same rationale as overAbsorbGlow above.
+        overHealAbsorbGlow[frame]:Hide()
     end
 
     hooksecurefunc("DefaultCompactUnitFrameSetup", defaultCompactUnitFrameSetup)
@@ -986,74 +1335,90 @@ do
 
     hooksecurefunc("DefaultCompactMiniFrameSetup", defaultCompactMiniFrameSetup)
 
-    local compactRaidFrameReservation_GetFrame
+    -- ORIGINAL (removed entirely, not just replaced):
+    -- local compactRaidFrameReservation_GetFrame
+    --
+    -- hooksecurefunc(
+    --     "CompactRaidFrameReservation_GetFrame",
+    --     function(self, key)
+    --         compactRaidFrameReservation_GetFrame = self.reservations[key]
+    --     end
+    -- )
+    --
+    -- local frameCreationSpecifiers = {
+    --     raid = {mapping = UnitGUID, setUpFunc = defaultCompactUnitFrameSetup},
+    --     pet = {setUpFunc = defaultCompactMiniFrameSetup},
+    --     flagged = {mapping = UnitGUID, setUpFunc = defaultCompactUnitFrameSetup},
+    --     target = {setUpFunc = defaultCompactMiniFrameSetup}
+    -- }
+    --
+    -- hooksecurefunc(
+    --     "CompactRaidFrameContainer_GetUnitFrame",
+    --     function(self, unit, frameType)
+    --         if not compactRaidFrameReservation_GetFrame then
+    --             local info = frameCreationSpecifiers[frameType]
+    --             local mapping
+    --
+    --             if info.mapping then
+    --                 mapping = info.mapping(unit)
+    --             else
+    --                 mapping = unit
+    --             end
+    --
+    --             local frame = self.frameReservations[frameType].reservations[mapping]
+    --             info.setUpFunc(frame)
+    --         end
+    --     end
+    -- )
+    --
+    -- As of the shared Retail/Classic UI codebase's raid frame rewrite, CompactRaidFrameContainerMixin:GetUnitFrame()
+    -- (formerly the global CompactRaidFrameContainer_GetUnitFrame) unconditionally calls
+    -- CompactUnitFrame_SetUpFrame(frame, info.setUpFunc) for every frame it hands out, reused or
+    -- not. That makes the hooks on DefaultCompactUnitFrameSetup/DefaultCompactMiniFrameSetup above
+    -- sufficient on their own; the old reservation-tracking workaround above is no longer needed.
 
-    hooksecurefunc(
-        "CompactRaidFrameReservation_GetFrame",
-        function(self, key)
-            compactRaidFrameReservation_GetFrame = self.reservations[key]
+    -- ORIGINAL wrapper (texture-creation body below is unchanged, only the
+    -- function signature/hook target changed - see the hooksecurefunc at the
+    -- bottom of this function for what it used to be attached to):
+    -- hooksecurefunc(
+    --     "DefaultCompactNamePlateFrameSetup",
+    --     function(frame)
+    --         if frame:IsForbidden() or myHealPrediction[frame] then
+    --             return
+    --         end
+    local function namePlateApplyFrameOptions(namePlateFrame)
+        local frame = namePlateFrame.UnitFrame
+
+        if not frame or frame:IsForbidden() or myHealPrediction[frame] then
+            return
         end
-    )
 
-    local frameCreationSpecifiers = {
-        raid = {mapping = UnitGUID, setUpFunc = defaultCompactUnitFrameSetup},
-        pet = {setUpFunc = defaultCompactMiniFrameSetup},
-        flagged = {mapping = UnitGUID, setUpFunc = defaultCompactUnitFrameSetup},
-        target = {setUpFunc = defaultCompactMiniFrameSetup}
-    }
+        healthBar[frame] = frame.healthBar
 
-    hooksecurefunc(
-        "CompactRaidFrameContainer_GetUnitFrame",
-        function(self, unit, frameType)
-            if not compactRaidFrameReservation_GetFrame then
-                local info = frameCreationSpecifiers[frameType]
-                local mapping
-
-                if info.mapping then
-                    mapping = info.mapping(unit)
-                else
-                    mapping = unit
-                end
-
-                local frame = self.frameReservations[frameType].reservations[mapping]
-                info.setUpFunc(frame)
-            end
-        end
-    )
-
-    hooksecurefunc(
-        "DefaultCompactNamePlateFrameSetup",
-        function(frame)
-            if frame:IsForbidden() or myHealPrediction[frame] then
-                return
-            end
-
-            healthBar[frame] = frame.healthBar
-
+            -- ORIGINAL (DRY cleanup, not a bug fix - same rationale as the
+            -- defaultCompactUnitFrameSetup comment above: nameplate frames are
+            -- confirmed always plain Textures here too):
+            -- myHealPrediction[frame]:ClearAllPoints()
+            -- myHealPrediction[frame]:SetTexture("Interface/TargetingFrame/UI-TargetingFrame-BarFill")
             myHealPrediction[healthBar[frame]] = createTexture(healthBar[frame], nil, "BORDER", 5)
             myHealPrediction[frame] = myHealPrediction[healthBar[frame]]
-            myHealPrediction[frame]:ClearAllPoints()
-            myHealPrediction[frame]:SetTexture("Interface/TargetingFrame/UI-TargetingFrame-BarFill")
+            setFillTexture(myHealPrediction[frame], "Interface/TargetingFrame/UI-TargetingFrame-BarFill")
 
             otherHealPrediction[healthBar[frame]] = createTexture(healthBar[frame], nil, "BORDER", 5)
             otherHealPrediction[frame] = otherHealPrediction[healthBar[frame]]
-            otherHealPrediction[frame]:ClearAllPoints()
-            otherHealPrediction[frame]:SetTexture("Interface/TargetingFrame/UI-TargetingFrame-BarFill")
+            setFillTexture(otherHealPrediction[frame], "Interface/TargetingFrame/UI-TargetingFrame-BarFill")
 
             myHealPrediction2[healthBar[frame]] = createTexture(healthBar[frame], nil, "BORDER", 5)
             myHealPrediction2[frame] = myHealPrediction2[healthBar[frame]]
-            myHealPrediction2[frame]:ClearAllPoints()
-            myHealPrediction2[frame]:SetTexture("Interface/TargetingFrame/UI-TargetingFrame-BarFill")
+            setFillTexture(myHealPrediction2[frame], "Interface/TargetingFrame/UI-TargetingFrame-BarFill")
 
             otherHealPrediction2[healthBar[frame]] = createTexture(healthBar[frame], nil, "BORDER", 5)
             otherHealPrediction2[frame] = otherHealPrediction2[healthBar[frame]]
-            otherHealPrediction2[frame]:ClearAllPoints()
-            otherHealPrediction2[frame]:SetTexture("Interface/TargetingFrame/UI-TargetingFrame-BarFill")
+            setFillTexture(otherHealPrediction2[frame], "Interface/TargetingFrame/UI-TargetingFrame-BarFill")
 
             totalAbsorb[healthBar[frame]] = createTexture(healthBar[frame], nil, "BORDER", 5)
             totalAbsorb[frame] = totalAbsorb[healthBar[frame]]
-            totalAbsorb[frame]:ClearAllPoints()
-            totalAbsorb[frame]:SetTexture("Interface\\RaidFrame\\Shield-Fill")
+            setFillTexture(totalAbsorb[frame], "Interface\\RaidFrame\\Shield-Fill")
 
             totalAbsorbOverlay[healthBar[frame]] = createTexture(healthBar[frame], nil, "BORDER", 6)
             totalAbsorbOverlay[frame] = totalAbsorbOverlay[healthBar[frame]]
@@ -1067,15 +1432,20 @@ do
             healAbsorb[frame]:ClearAllPoints()
             healAbsorb[frame]:SetTexture("Interface\\RaidFrame\\Absorb-Fill", true, true)
 
+            -- ORIGINAL (DRY cleanup, same rationale as above):
+            -- healAbsorbLeftShadow[frame]:ClearAllPoints()
+            -- healAbsorbLeftShadow[frame]:SetTexture("Interface\\RaidFrame\\Absorb-Edge")
             healAbsorbLeftShadow[healthBar[frame]] = createTexture(healthBar[frame], nil, "ARTWORK", 1)
             healAbsorbLeftShadow[frame] = healAbsorbLeftShadow[healthBar[frame]]
-            healAbsorbLeftShadow[frame]:ClearAllPoints()
-            healAbsorbLeftShadow[frame]:SetTexture("Interface\\RaidFrame\\Absorb-Edge")
+            setFillTexture(healAbsorbLeftShadow[frame], "Interface\\RaidFrame\\Absorb-Edge")
 
+            -- ORIGINAL (DRY cleanup for the ClearAllPoints/SetTexture pair only;
+            -- SetTexCoord stays a direct call, unrelated to setFillTexture):
+            -- healAbsorbRightShadow[frame]:ClearAllPoints()
+            -- healAbsorbRightShadow[frame]:SetTexture("Interface\\RaidFrame\\Absorb-Edge")
             healAbsorbRightShadow[healthBar[frame]] = createTexture(healthBar[frame], nil, "ARTWORK", 1)
             healAbsorbRightShadow[frame] = healAbsorbRightShadow[healthBar[frame]]
-            healAbsorbRightShadow[frame]:ClearAllPoints()
-            healAbsorbRightShadow[frame]:SetTexture("Interface\\RaidFrame\\Absorb-Edge")
+            setFillTexture(healAbsorbRightShadow[frame], "Interface\\RaidFrame\\Absorb-Edge")
             healAbsorbRightShadow[frame]:SetTexCoord(1, 0, 0, 1)
 
             overAbsorbGlow[healthBar[frame]] = createTexture(healthBar[frame], nil, "ARTWORK", 2)
@@ -1086,6 +1456,11 @@ do
             overAbsorbGlow[frame]:SetPoint("BOTTOMLEFT", healthBar[frame], "BOTTOMRIGHT", -4, -1)
             overAbsorbGlow[frame]:SetPoint("TOPLEFT", healthBar[frame], "TOPRIGHT", -4, 1)
             overAbsorbGlow[frame]:SetHeight(8)
+            -- ORIGINAL: no Hide() call here - a freshly created texture defaults to
+            -- shown once SetTexture is called, so this glow was visible on
+            -- nameplates until the first updateHealPrediction pass for this frame
+            -- explicitly hid it.
+            overAbsorbGlow[frame]:Hide()
 
             overHealAbsorbGlow[healthBar[frame]] = createTexture(healthBar[frame], nil, "ARTWORK", 2)
             overHealAbsorbGlow[frame] = overHealAbsorbGlow[healthBar[frame]]
@@ -1095,28 +1470,91 @@ do
             overHealAbsorbGlow[frame]:SetPoint("BOTTOMRIGHT", healthBar[frame], "BOTTOMLEFT", 2, -1)
             overHealAbsorbGlow[frame]:SetPoint("TOPRIGHT", healthBar[frame], "TOPLEFT", 2, -1)
             overHealAbsorbGlow[frame]:SetHeight(8)
-        end
-    )
+            -- ORIGINAL: no Hide() call here - same rationale as overAbsorbGlow above.
+            overHealAbsorbGlow[frame]:Hide()
+    --         end
+    --     end
+    -- )
+    end
 
+    -- ORIGINAL: the wrapping hooksecurefunc("DefaultCompactNamePlateFrameSetup", ...)
+    -- shown commented above namePlateApplyFrameOptions is what used to close/register
+    -- here instead of this if-block.
+    if NamePlateBaseMixin and NamePlateBaseMixin.ApplyFrameOptions then
+        -- Nameplate setup no longer goes through a named global function
+        -- (DefaultCompactNamePlateFrameSetup); NamePlateBaseMixin:ApplyFrameOptions()
+        -- now builds an inline closure and passes it to CompactUnitFrame_SetUpFrame instead.
+        hooksecurefunc(NamePlateBaseMixin, "ApplyFrameOptions", namePlateApplyFrameOptions)
+    end
+
+    -- ORIGINAL: local function initUnitFrame(frame, createTextureArgs)
+    --     local textures = {} - i.e. no nil-guard, went straight into the loop below.
     local function initUnitFrame(frame, createTextureArgs)
+        if not frame then
+            -- Some legacy globals this is called with (e.g. numbered
+            -- PartyMemberFrame1..4) no longer exist in the shared Retail/Classic UI codebase;
+            -- those unit types are handled by the CompactPartyFrame /
+            -- DefaultCompactUnitFrameSetup path instead.
+            return
+        end
+
         local textures = {}
 
+        -- ORIGINAL: every entry here used getChild(frame, unpack(depth)) to find its
+        -- parent, regardless of depth. Diagnostic logging (during the mana-cost bar
+        -- investigation, then confirmed here for the heal-prediction/absorb bars too)
+        -- found getChild(PlayerFrame, 1, 1) resolves to an unrelated, hidden, unnamed
+        -- utility frame in the shared Retail/Classic UI codebase's current PlayerFrame
+        -- layout - every entry below using a non-empty depth (i.e. every one of these
+        -- bars except totalAbsorbBar/totalAbsorbBarOverlay, which use an empty depth
+        -- and so already correctly resolved to frame itself) was being parented to
+        -- that same hidden frame, making myHealPrediction/otherHealPrediction/
+        -- myHealPrediction2/otherHealPrediction2/healAbsorbBar/its shadows/
+        -- overAbsorbGlow/overHealAbsorbGlow permanently invisible on PlayerFrame
+        -- specifically (other frames' own getChild(frame, 1, 1) apparently resolves
+        -- to something visible, which is why only PlayerFrame was affected). These
+        -- are all conceptually children of the health bar, so parent directly to
+        -- frame.healthbar instead of the fragile positional lookup.
         for _, args in pairs(createTextureArgs) do
             local depth, name, layer, subLayer = unpack(args)
-            textures[name] = createTexture(getChild(frame, unpack(depth)), name, layer, subLayer)
+            local parent = #depth == 0 and frame or frame.healthbar
+            textures[name] = createTexture(parent, name, layer, subLayer)
         end
 
         healthBar[frame] = frame.healthbar
 
-        if not frame.myManaCostPredictionBar and textures["$parentManaCostPredictionBar"] then
-            frame.myManaCostPredictionBar = textures["$parentManaCostPredictionBar"]
+        -- ORIGINAL: frame.myManaCostPredictionBar used to be pulled from
+        -- textures["$parentManaCostPredictionBar"] (created via the generic
+        -- getChild(frame, 1, 1) loop above) - see the ORIGINAL comment on that entry's
+        -- old location in the createTextureArgs table for why that was broken (parented
+        -- to a hidden, unrelated frame). Created directly on frame.manabar instead,
+        -- which is always a real, visible frame by this point.
+        -- Bug fixed here: the first version of this fix checked only "frame.manabar"
+        -- truthiness, but every unit frame (PetFrame, TargetFrame, etc.) has its own
+        -- .manabar - that created a myManaCostPredictionBar for every frame type, not
+        -- just the player, tripping the "assert(frame.unit == 'player')" guard below
+        -- for PetFrame. Explicitly scoped to the player frame only, matching the
+        -- original textures[...] lookup's effective behavior (only PlayerFrame's own
+        -- createTextureArgs list ever included this entry).
+        if not frame.myManaCostPredictionBar and frame.manabar and frame.unit == "player" then
+            frame.myManaCostPredictionBar = createTexture(frame.manabar, "$parentManaCostPredictionBar", "BACKGROUND")
         end
 
+        -- ORIGINAL: every setFillTexture(x, path) call from here through
+        -- healAbsorbRightShadow below used to be a plain
+        --     x:ClearAllPoints()
+        --     x:SetTexture(path)
+        -- pair (3-arg tiled SetTexture calls for totalAbsorbOverlay/healAbsorb are
+        -- shown with their original ClearAllPoints()/SetTexture() pair inline at
+        -- their own "if x.SetTexture then" guards below). These all threw "attempt
+        -- to call a nil value" on Player/Pet/party/target frames once the shared
+        -- Retail/Classic UI codebase's StatusBarOverlaySegmentMixin bars replaced the plain
+        -- Textures these names used to resolve to - see setFillTexture's comment
+        -- near the top of the file for the full explanation.
         if frame.myManaCostPredictionBar then
             assert(frame.unit == "player")
 
-            frame.myManaCostPredictionBar:ClearAllPoints()
-            frame.myManaCostPredictionBar:SetTexture("Interface\\TargetingFrame\\UI-StatusBar")
+            setFillTexture(frame.myManaCostPredictionBar, "Interface\\TargetingFrame\\UI-StatusBar")
 
             proxyFrame[frame] = CreateFrame("Frame")
             proxyFrame[frame]:RegisterUnitEvent("UNIT_SPELLCAST_START", frame.unit)
@@ -1138,44 +1576,54 @@ do
             return
         end
 
-        myHealPrediction[frame]:ClearAllPoints()
-        myHealPrediction[frame]:SetTexture("Interface\\TargetingFrame\\UI-StatusBar")
+        setFillTexture(myHealPrediction[frame], "Interface\\TargetingFrame\\UI-StatusBar")
 
         myHealPrediction2[frame] = textures["$parentMyHealPredictionBar2"]
-        myHealPrediction2[frame]:ClearAllPoints()
-        myHealPrediction2[frame]:SetTexture("Interface\\TargetingFrame\\UI-StatusBar")
+        setFillTexture(myHealPrediction2[frame], "Interface\\TargetingFrame\\UI-StatusBar")
 
         otherHealPrediction[frame] = textures["$parentOtherHealPredictionBar"]
-        otherHealPrediction[frame]:ClearAllPoints()
-        otherHealPrediction[frame]:SetTexture("Interface\\TargetingFrame\\UI-StatusBar")
+        setFillTexture(otherHealPrediction[frame], "Interface\\TargetingFrame\\UI-StatusBar")
 
         otherHealPrediction2[frame] = textures["$parentOtherHealPredictionBar2"]
-        otherHealPrediction2[frame]:ClearAllPoints()
-        otherHealPrediction2[frame]:SetTexture("Interface\\TargetingFrame\\UI-StatusBar")
+        setFillTexture(otherHealPrediction2[frame], "Interface\\TargetingFrame\\UI-StatusBar")
 
         totalAbsorb[frame] = textures["$parentTotalAbsorbBar"]
-        totalAbsorb[frame]:ClearAllPoints()
-        totalAbsorb[frame]:SetTexture("Interface\\RaidFrame\\Shield-Fill")
+        setFillTexture(totalAbsorb[frame], "Interface\\RaidFrame\\Shield-Fill")
 
         totalAbsorbOverlay[frame] = textures["$parentTotalAbsorbBarOverlay"]
         totalAbsorb[frame].overlay = totalAbsorbOverlay[frame]
-        totalAbsorbOverlay[frame]:ClearAllPoints()
-        totalAbsorbOverlay[frame]:SetTexture("Interface\\RaidFrame\\Shield-Overlay", true, true)
-        totalAbsorbOverlay[frame]:SetAllPoints(totalAbsorb[frame])
-        totalAbsorbOverlay[frame].tileSize = 32
+
+        -- ORIGINAL: unconditional (no "if x.SetTexture then" guard at all) -
+        -- totalAbsorbOverlay[frame]:ClearAllPoints()/SetTexture(...)/SetAllPoints(...)/
+        -- .tileSize = 32 ran unconditionally every time. These two need the
+        -- 3-argument (path, horizTile, vertTile) SetTexture form, which
+        -- setFillTexture doesn't cover, so they're guarded inline instead.
+        if totalAbsorbOverlay[frame].SetTexture then
+            totalAbsorbOverlay[frame]:ClearAllPoints()
+            totalAbsorbOverlay[frame]:SetTexture("Interface\\RaidFrame\\Shield-Overlay", true, true)
+            totalAbsorbOverlay[frame]:SetAllPoints(totalAbsorb[frame])
+            totalAbsorbOverlay[frame].tileSize = 32
+        end
 
         healAbsorb[frame] = textures["$parentHealAbsorbBar"]
-        healAbsorb[frame]:ClearAllPoints()
-        healAbsorb[frame]:SetTexture("Interface\\RaidFrame\\Absorb-Fill", true, true)
+
+        -- ORIGINAL: unconditional healAbsorb[frame]:ClearAllPoints()/SetTexture(...),
+        -- no guard.
+        if healAbsorb[frame].SetTexture then
+            healAbsorb[frame]:ClearAllPoints()
+            healAbsorb[frame]:SetTexture("Interface\\RaidFrame\\Absorb-Fill", true, true)
+        end
 
         healAbsorbLeftShadow[frame] = textures["$parentHealAbsorbBarLeftShadow"]
-        healAbsorbLeftShadow[frame]:ClearAllPoints()
-        healAbsorbLeftShadow[frame]:SetTexture("Interface\\RaidFrame\\Absorb-Edge")
+        setFillTexture(healAbsorbLeftShadow[frame], "Interface\\RaidFrame\\Absorb-Edge")
 
         healAbsorbRightShadow[frame] = textures["$parentHealAbsorbBarRightShadow"]
-        healAbsorbRightShadow[frame]:ClearAllPoints()
-        healAbsorbRightShadow[frame]:SetTexture("Interface\\RaidFrame\\Absorb-Edge")
-        healAbsorbRightShadow[frame]:SetTexCoord(1, 0, 0, 1)
+        setFillTexture(healAbsorbRightShadow[frame], "Interface\\RaidFrame\\Absorb-Edge")
+
+        -- ORIGINAL: unconditional healAbsorbRightShadow[frame]:SetTexCoord(1, 0, 0, 1), no guard.
+        if healAbsorbRightShadow[frame].SetTexCoord then
+            healAbsorbRightShadow[frame]:SetTexCoord(1, 0, 0, 1)
+        end
 
         overAbsorbGlow[frame] = textures["$parentOverAbsorbGlow"]
         overAbsorbGlow[frame]:ClearAllPoints()
@@ -1184,6 +1632,10 @@ do
         overAbsorbGlow[frame]:SetPoint("BOTTOMLEFT", healthBar[frame], "BOTTOMRIGHT", -7, 0)
         overAbsorbGlow[frame]:SetPoint("TOPLEFT", healthBar[frame], "TOPRIGHT", -7, 0)
         overAbsorbGlow[frame]:SetWidth(16)
+        -- ORIGINAL: no Hide() call here - a freshly created texture defaults to
+        -- shown once SetTexture is called, so this glow was visible until the
+        -- first updateHealPrediction pass for this frame explicitly hid it.
+        overAbsorbGlow[frame]:Hide()
 
         overHealAbsorbGlow[frame] = textures["$parentOverHealAbsorbGlow"]
         overHealAbsorbGlow[frame]:ClearAllPoints()
@@ -1192,6 +1644,8 @@ do
         overHealAbsorbGlow[frame]:SetPoint("BOTTOMRIGHT", healthBar[frame], "BOTTOMLEFT", 7, 0)
         overHealAbsorbGlow[frame]:SetPoint("TOPRIGHT", healthBar[frame], "TOPLEFT", 7, 0)
         overHealAbsorbGlow[frame]:SetWidth(16)
+        -- ORIGINAL: no Hide() call here - same rationale as overAbsorbGlow above.
+        overHealAbsorbGlow[frame]:Hide()
 
         frame:RegisterUnitEvent("UNIT_MAXHEALTH", frame.unit)
 
@@ -1214,7 +1668,17 @@ do
             {{1, 1}, "$parentOtherHealPredictionBar", "BACKGROUND"},
             {{1, 1}, "$parentMyHealPredictionBar2", "BACKGROUND"},
             {{1, 1}, "$parentOtherHealPredictionBar2", "BACKGROUND"},
-            {{1, 1}, "$parentManaCostPredictionBar", "BACKGROUND"},
+            -- ORIGINAL: $parentManaCostPredictionBar used to be created here via the
+            -- same getChild(frame, 1, 1) path as the entries above. Diagnostic logging
+            -- confirmed getChild(PlayerFrame, 1, 1) resolves to an unrelated, hidden,
+            -- unnamed utility frame (frame level 1001) in the shared Retail/Classic UI
+            -- codebase's current PlayerFrame layout - unlike the other bars above, this
+            -- one never resolves via getTexture()'s native-name lookup first (no native
+            -- StatusBarOverlaySegment exists for it in Classic Era), so it always falls
+            -- through to frame:CreateTexture(...) - meaning it was the only bar actually
+            -- parented to that hidden frame, making it permanently invisible regardless
+            -- of its own Show()/SetVertexColor()/position. See initUnitFrame below,
+            -- where it's now created directly on frame.manabar instead.
             {{1, 1}, "$parentHealAbsorbBar", "BACKGROUND"},
             {{1, 1}, "$parentHealAbsorbBarLeftShadow", "BACKGROUND"},
             {{1, 1}, "$parentHealAbsorbBarRightShadow", "BACKGROUND"},
