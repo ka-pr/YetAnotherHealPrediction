@@ -1,0 +1,6 @@
+package-as: YetAnotherHealPrediction
+
+license-output: LICENSE
+
+ignore:
+    - libs/LibStub/tests
