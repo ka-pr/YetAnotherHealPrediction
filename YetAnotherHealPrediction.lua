@@ -262,7 +262,14 @@ local ClassicHealPredictionDefaultSettings = {
     },
     showManaCostPrediction = true,
     raidFramesMaxOverflow = toggleValue(0.05, true),
-    unitFramesMaxOverflow = toggleValue(0.0, true)
+    unitFramesMaxOverflow = toggleValue(0.0, true),
+    -- Opt-in, not opt-out: attaching heal prediction textures to nameplates can
+    -- trigger a Blizzard-side "Can't measure restricted regions" taint error on
+    -- Classic Era 1.15.9+, since nameplate auras (new to this patch) share a
+    -- frame hierarchy with the health bar this feature attaches to. Defaulting
+    -- this off protects existing users who never asked for nameplate heal
+    -- prediction from a bug they'd otherwise have no way to know about.
+    enableNameplates = false
 }
 local ClassicHealPredictionSettings = ClassicHealPredictionDefaultSettings
 
@@ -410,6 +417,7 @@ local loadedFrame = false
 local checkBoxes
 local checkBox2
 local checkBox3
+local checkBox4
 local slider
 local slider2
 local slider3
@@ -1393,6 +1401,12 @@ do
             return
         end
 
+        -- Opt-in only - see ClassicHealPredictionDefaultSettings.enableNameplates
+        -- for why nameplates default off (known taint issue).
+        if not ClassicHealPredictionSettings.enableNameplates then
+            return
+        end
+
         healthBar[frame] = frame.healthBar
 
             -- ORIGINAL (DRY cleanup, not a bug fix - same rationale as the
@@ -1885,6 +1899,8 @@ local function ClassicHealPredictionFrame_Refresh()
 
     checkBox2:SetChecked(ClassicHealPredictionSettings.showManaCostPrediction)
 
+    checkBox4:SetChecked(ClassicHealPredictionSettings.enableNameplates)
+
     for _, colorSwatch in ipairs(colorSwatches) do
         local r, g, b, a = unpack(ClassicHealPredictionSettings.colors[colorSwatch.index])
         colorSwatch:GetNormalTexture():SetVertexColor(r, g, b, a)
@@ -2327,6 +2343,52 @@ function ClassicHealPredictionFrame_OnLoad(self)
             ClassicHealPredictionSettings.showManaCostPrediction = self:GetChecked()
 
             updateAllFrames()
+        end
+    )
+
+    local checkBoxName4 = format("ClassicHealPredictionCheckbox%d", #checkBoxes + 3)
+    checkBox4 = CreateFrame("CheckButton", checkBoxName4, self, "InterfaceOptionsCheckButtonTemplate")
+    checkBox4:SetPoint("TOPLEFT", checkBox2, "BOTTOMLEFT", 0, 0)
+    checkBox4.Text = _G[checkBoxName4 .. "Text"]
+    checkBox4.Text:SetText("Show heal prediction on nameplates (Blizzard's 1.15.9 nameplate changes can make attaching this to the health bar taint the UI - not a heal prediction bug)")
+    checkBox4.Text:SetTextColor(1, 1, 1)
+    -- Long enough to run off the panel on one line - constrain the width so it
+    -- wraps instead.
+    checkBox4.Text:SetWidth(480)
+    checkBox4.Text:SetWordWrap(true)
+    checkBox4.Text:SetJustifyH("LEFT")
+
+    -- Frames already touched while this was enabled stay exposed even after
+    -- disabling it again (the setting only gates *new* attachments), so a
+    -- reload is the only reliable way to fully apply either direction of this
+    -- toggle - confirmed via live testing, not just theoretical caution.
+    StaticPopupDialogs[ADDON_NAME .. "_NAMEPLATES_RELOAD"] = {
+        text = "This setting requires a UI reload to fully take effect. Reload now?",
+        button1 = "Reload Now",
+        button2 = "Cancel",
+        OnAccept = function(_, newValue)
+            -- Write to both the local staging table and the persisted
+            -- SavedVariables directly - reloading immediately skips the normal
+            -- Okay/commit flow (ClassicHealPredictionFrame_Okay), which is what
+            -- writes staged changes to _G.ClassicHealPredictionSettings. Without
+            -- this, the reload discards the change before it's ever saved.
+            ClassicHealPredictionSettings.enableNameplates = newValue
+            _G.ClassicHealPredictionSettings.enableNameplates = newValue
+            local reload = (C_UI and C_UI.Reload) or ReloadUI
+            reload()
+        end,
+        OnCancel = function(_, newValue)
+            checkBox4:SetChecked(not newValue)
+        end,
+        timeout = 0,
+        whileDead = true,
+        hideOnEscape = true,
+    }
+
+    checkBox4:SetScript(
+        "OnClick",
+        function(self)
+            StaticPopup_Show(ADDON_NAME .. "_NAMEPLATES_RELOAD", nil, nil, self:GetChecked())
         end
     )
 
