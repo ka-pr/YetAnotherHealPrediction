@@ -2,5 +2,8 @@ package-as: YetAnotherHealPrediction
 
 license-output: LICENSE
 
+manual-changelog: CHANGELOG.md
+changelog-title: YetAnotherHealPrediction
+
 ignore:
     - libs/LibStub/tests
