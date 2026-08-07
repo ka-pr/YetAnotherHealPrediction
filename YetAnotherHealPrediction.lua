@@ -2413,6 +2413,8 @@ function ClassicHealPredictionFrame_OnLoad(self)
 
             colorSwatch.index = i
 
+            local positionInGroup = j
+
             if k == 1 and j == 1 then
                 colorSwatch:SetPoint("TOPRIGHT", -235, -50)
             elseif k ~= 1 and j == 1 then
@@ -2426,33 +2428,94 @@ function ClassicHealPredictionFrame_OnLoad(self)
             local r, g, b, a = unpack(ClassicHealPredictionSettings.colors[colorSwatch.index])
             colorSwatch:GetNormalTexture():SetVertexColor(r, g, b, a)
 
-            local function callback(previousValues)
-                local newR, newG, newB, newA
-
-                if previousValues then
-                    newR, newG, newB, newA = unpack(previousValues)
-                else
-                    newA, newR, newG, newB = 1.0 - OpacitySliderFrame:GetValue(), ColorPickerFrame:GetColorRGB()
-                end
-
+            local function applyColor(newR, newG, newB, newA)
                 colorSwatch:GetNormalTexture():SetVertexColor(newR, newG, newB, newA)
                 ClassicHealPredictionSettings.colors[colorSwatch.index] = {gradient(newR, newG, newB, newA)}
 
                 updateAllFrames()
             end
 
+            local function onColorChanged()
+                local newR, newG, newB = ColorPickerFrame:GetColorRGB()
+                local newA = ColorPickerFrame:GetColorAlpha()
+                applyColor(newR, newG, newB, newA)
+            end
+
+            local function onCancel()
+                local newR, newG, newB, newA = ColorPickerFrame:GetPreviousValues()
+                applyColor(newR, newG, newB, newA)
+            end
+
             colorSwatch:SetScript(
                 "OnClick",
                 function(self)
                     local r, g, b, a = unpack(ClassicHealPredictionSettings.colors[colorSwatch.index])
-                    ColorPickerFrame.hasOpacity, ColorPickerFrame.opacity = true, 1.0 - a
-                    ColorPickerFrame.previousValues = {r, g, b, a}
-                    ColorPickerFrame.func, ColorPickerFrame.opacityFunc, ColorPickerFrame.cancelFunc = callback, callback, callback
-                    ColorPickerFrame:SetColorRGB(r, g, b)
-                    ColorPickerFrame:Hide()
-                    ColorPickerFrame:Show()
+                    -- ORIGINAL: set ColorPickerFrame.func/.opacityFunc/.cancelFunc/.hasOpacity/
+                    -- .opacity/.previousValues directly, then :SetColorRGB() + :Hide() + :Show().
+                    -- That API is gone as of the shared Retail/Classic UI codebase - the color
+                    -- picker is now invoked via SetupColorPickerAndShow(options), which is why the
+                    -- Okay button threw "attempt to call a nil value" (it looked for something
+                    -- SetupColorPickerAndShow sets up internally, not the old .func property).
+                    ColorPickerFrame:SetupColorPickerAndShow({
+                        swatchFunc = onColorChanged,
+                        opacityFunc = onColorChanged,
+                        cancelFunc = onCancel,
+                        hasOpacity = true,
+                        opacity = a,
+                        r = r,
+                        g = g,
+                        b = b,
+                    })
                 end
             )
+
+            colorSwatch:SetScript(
+                "OnEnter",
+                function(self)
+                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+                    GameTooltip:AddLine(text, 1, 1, 1)
+
+                    if #slots == 1 then
+                        GameTooltip:AddLine("Mana cost prediction bar color.", nil, nil, nil, true)
+                    elseif k == 1 then
+                        -- First row only: detailed explanation with an example. The other
+                        -- rows (Raid Frames: Other healing, Unit Frames: My/Other healing)
+                        -- work identically, just for a different heal source/frame type, so
+                        -- they get the short version below instead of repeating all this.
+                        if positionInGroup == 1 then
+                            GameTooltip:AddLine("Immediate incoming heal.", nil, nil, nil, true)
+                            GameTooltip:AddLine(" ")
+                            GameTooltip:AddLine("The portion of your incoming heal(s) on this unit landing within the near-term time window (the \"delta\" setting). Example: if you cast only Renew, this is the value of the very next tick.", nil, nil, nil, true)
+                            GameTooltip:AddLine(" ")
+                            GameTooltip:AddLine("Multiple incoming heals from you are combined, not shown separately. Example: if a Renew tick is about to land and you also cast a direct heal, the immediate incoming heal is the sum of both.", nil, nil, nil, true)
+                        elseif positionInGroup == 2 then
+                            GameTooltip:AddLine("Remaining incoming heal.", nil, nil, nil, true)
+                            GameTooltip:AddLine(" ")
+                            GameTooltip:AddLine("The rest of your incoming heal(s) on this unit, landing after that near-term window. Example: for Renew only, this is the sum of all the ticks after the next one.", nil, nil, nil, true)
+                        elseif positionInGroup == 3 then
+                            GameTooltip:AddLine("Immediate incoming heal (overheal warning color).", nil, nil, nil, true)
+                            GameTooltip:AddLine(" ")
+                            GameTooltip:AddLine("Same value as the 1st color, shown instead when the total predicted heal would overheal past your Overheal Threshold setting.", nil, nil, nil, true)
+                        else
+                            GameTooltip:AddLine("Remaining incoming heal (overheal warning color).", nil, nil, nil, true)
+                            GameTooltip:AddLine(" ")
+                            GameTooltip:AddLine("Same value as the 2nd color, shown instead when the total predicted heal would overheal past your Overheal Threshold setting.", nil, nil, nil, true)
+                        end
+                    elseif positionInGroup == 1 then
+                        GameTooltip:AddLine("Immediate incoming heal.", nil, nil, nil, true)
+                    elseif positionInGroup == 2 then
+                        GameTooltip:AddLine("Remaining incoming heal.", nil, nil, nil, true)
+                    elseif positionInGroup == 3 then
+                        GameTooltip:AddLine("Immediate incoming heal (overheal warning color).", nil, nil, nil, true)
+                    else
+                        GameTooltip:AddLine("Remaining incoming heal (overheal warning color).", nil, nil, nil, true)
+                    end
+
+                    GameTooltip:Show()
+                end
+            )
+
+            colorSwatch:SetScript("OnLeave", GameTooltip_Hide)
 
             tinsert(colorSwatches[k], colorSwatch)
         end
