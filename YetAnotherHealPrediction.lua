@@ -464,7 +464,33 @@ local function updateHealPrediction(frame, unit, cutoff, gradient, colorPalette,
     local healAbsorb = healAbsorb[frame]
 
     if healAbsorb then
-        currentHealAbsorb = 0
+        -- UnitGetTotalHealAbsorbs is the correct native API for this (the
+        -- counterpart to UnitGetTotalAbsorbs below), but as of this Classic
+        -- Era client it's a stub: confirmed live it returns 0 for every unit
+        -- regardless of input, including nonsense unit tokens, with no
+        -- observable difference between a unit under a real heal-absorb
+        -- effect and one that doesn't exist. Blizzard's own client-side data
+        -- for this apparently isn't wired up for Classic Era yet either -
+        -- BetterBlizzFrames, which correctly displays real Power Word: Shield
+        -- amounts, doesn't call this API at all; it maintains its own ~130
+        -- entry spell database and derives/tracks absorb amounts from
+        -- SPELL_AURA_APPLIED/SPELL_ABSORBED combat log events instead. This
+        -- call is left in place (rather than reverting to the old hardcoded
+        -- 0) because it's the technically-correct call and will start
+        -- working automatically if/when Blizzard fixes the underlying data -
+        -- but don't expect it to show real values until then. Building an
+        -- actual working equivalent would mean replicating BetterBlizzFrames'
+        -- approach (a maintained spell database + combat log tracking, on
+        -- the same scale as LibHealComm) - deferred, not started.
+        --
+        -- Worth noting Blizzard's own native heal-prediction API has a
+        -- similar "present but incomplete" character, just less severe:
+        -- UnitGetIncomingHeals (not called anywhere in this file - this
+        -- addon relies on LibHealComm entirely, see getIncomingHeals above)
+        -- only predicts direct/instant heals, not HoTs - real data, just an
+        -- incomplete picture, unlike the absorb APIs here which are
+        -- currently pure stubs.
+        currentHealAbsorb = (unit and UnitGetTotalHealAbsorbs(unit)) or 0
 
         -- ORIGINAL: unconditional overHealAbsorbGlow[frame]:Show()/Hide(), no guard.
         -- Default party member frames set healAbsorb[frame] (memberHealthBar.HealAbsorbBar
@@ -625,6 +651,17 @@ local function updateHealPrediction(frame, unit, cutoff, gradient, colorPalette,
 
     local overAbsorb = false
 
+    -- NOTE: despite the name, currentTotalAbsorb here is NOT a real damage-
+    -- absorption shield amount (e.g. Power Word: Shield) - it's derived
+    -- purely from predicted-heal overflow (health/maxHealth/allIncomingHeal),
+    -- repurposing the totalAbsorb bar's shield-style art to visualize
+    -- predicted overheal capacity instead. UnitGetTotalAbsorbs(unit), the
+    -- actual native API for real shields, is - like UnitGetTotalHealAbsorbs
+    -- above - confirmed to be a non-functional stub on this Classic Era
+    -- client (always returns 0, live-tested against a unit with an active,
+    -- visually-confirmed 48-point Power Word: Shield). So this bar currently
+    -- can't show real shields either way; see the UnitGetTotalHealAbsorbs
+    -- comment above for what a real fix would require.
     if health - currentHealAbsorb + allIncomingHeal + currentTotalAbsorb >= maxHealth or health + currentTotalAbsorb >= maxHealth then
         if currentTotalAbsorb > 0 then
             overAbsorb = true
@@ -953,6 +990,18 @@ hooksecurefunc("CompactUnitFrame_UpdateHealth", defer_CompactUnitFrame_UpdateHea
 
 hooksecurefunc("CompactUnitFrame_UpdateMaxHealth", defer_CompactUnitFrame_UpdateHealPrediction)
 
+-- Neither of these was hooked before, so updateHealPrediction (and therefore
+-- currentHealAbsorb/currentTotalAbsorb) only ever recomputed as a side effect
+-- of a health/heal-prediction update, not reliably when just an absorb shield
+-- changes on its own.
+if CompactUnitFrame_UpdateHealAbsorb then
+    hooksecurefunc("CompactUnitFrame_UpdateHealAbsorb", defer_CompactUnitFrame_UpdateHealPrediction)
+end
+
+if CompactUnitFrame_UpdateAbsorb then
+    hooksecurefunc("CompactUnitFrame_UpdateAbsorb", defer_CompactUnitFrame_UpdateHealPrediction)
+end
+
 -- ORIGINAL: this hook did not exist.
 -- Belt-and-suspenders fix for the same symptom as the UNIT_HEALTH UnregisterEvent
 -- hook below (see "ORIGINAL (pre shared Retail/Classic UI codebase rewrite)" further down): with
@@ -1224,6 +1273,16 @@ local function updateAllFrames()
     end
 end
 
+-- Shields are auras, and UNIT_AURA is what actually fires reliably on this
+-- client (confirmed live - UNIT_ABSORB_AMOUNT_CHANGED/UNIT_HEAL_ABSORB_AMOUNT_CHANGED
+-- never fire at all here). Without this, currentHealAbsorb/currentTotalAbsorb
+-- only ever recomputed as a side effect of unrelated health updates.
+local unitFrameByUnit = {
+    player = PlayerFrame,
+    target = TargetFrame,
+    pet = PetFrame,
+}
+
 local function ClassicHealPrediction_OnEvent(event, arg1)
     if event == "GROUP_ROSTER_UPDATE" then
         if InCombatLockdown() then
@@ -1234,6 +1293,20 @@ local function ClassicHealPrediction_OnEvent(event, arg1)
                     end
                 end
             end
+        end
+    elseif event == "UNIT_AURA" then
+        local unit = arg1
+        local compactUnitFrames = unit and guidToCompactUnitFrame[UnitGUID(unit)]
+
+        if compactUnitFrames then
+            for compactUnitFrame in pairs(compactUnitFrames) do
+                defer_CompactUnitFrame_UpdateHealPrediction(compactUnitFrame)
+            end
+        end
+
+        local directFrame = unit and unitFrameByUnit[unit]
+        if directFrame then
+            defer_UnitFrameHealPredictionBars_Update(directFrame)
         end
     else
         local namePlateUnitToken = arg1
@@ -2001,6 +2074,7 @@ function ClassicHealPredictionFrame_OnLoad(self)
     frame:RegisterEvent("NAME_PLATE_UNIT_ADDED")
     frame:RegisterEvent("NAME_PLATE_UNIT_REMOVED")
     frame:RegisterEvent("GROUP_ROSTER_UPDATE")
+    frame:RegisterEvent("UNIT_AURA")
 
     frame:SetScript(
         "OnEvent",
