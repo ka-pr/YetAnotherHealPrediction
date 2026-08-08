@@ -1,5 +1,12 @@
 # Changelog
 
+## v3.0.4
+
+- Fixed raid and party frame heal prediction colors rendering wrong (e.g. red appearing black, yellow appearing green) instead of the color set in settings.
+- Fixed color changes made through the color picker not saving if the settings panel wasn't explicitly confirmed before a UI reload.
+- Added manual R/G/B number entry to the color picker, in addition to the color wheel.
+- Clarified in the color swatch tooltips that the "overheal warning" colors only apply when the overheal threshold setting is enabled, and swap the whole bar rather than just the overhealing portion.
+
 ## v3.0.3
 
 - Fixed the color picker in settings not saving color changes.

@@ -102,16 +102,6 @@ local function toggleValue(value, bool)
     return value
 end
 
-local colorCache = {}
-local function getColor(r, g, b, a)
-    a = a or 1
-    colorCache[r] = colorCache[r] or {}
-    colorCache[r][g] = colorCache[r][g] or {}
-    colorCache[r][g][b] = colorCache[r][g][b] or {}
-    colorCache[r][g][b][a] = colorCache[r][g][b][a] or CreateColor(r, g, b, a)
-    return colorCache[r][g][b][a]
-end
-
 local function rgbToHsl(r, g, b, a)
     local max, min = max(r, g, b), min(r, g, b)
     local h, s, l
@@ -508,7 +498,16 @@ local function updateHealPrediction(frame, unit, cutoff, gradient, colorPalette,
         if a == 0 then
             myIncomingHeal1 = 0
         else
-            myHealPrediction1:SetGradient("VERTICAL", getColor(r2, g2, b2, a), getColor(r, g, b, a))
+            -- myHealPrediction1's name (assigned via createTexture's $parent
+            -- naming, see the getTexture/createTexture comment above) collides
+            -- with a native Blizzard texture on some frame types, which has
+            -- its own non-white base color. SetGradient/SetVertexColor
+            -- multiply against that base, so without resetting it to white
+            -- first, any color set here comes out tinted/blackened.
+            if myHealPrediction1.SetColorTexture then
+                myHealPrediction1:SetColorTexture(1, 1, 1)
+            end
+            setFillVertexColor(myHealPrediction1, r, g, b, a)
         end
 
         r, g, b, a, r2, g2, b2 = unpack(colors[colorPalette[2]])
@@ -516,7 +515,7 @@ local function updateHealPrediction(frame, unit, cutoff, gradient, colorPalette,
         if a == 0 then
             myIncomingHeal2 = 0
         else
-            myHealPrediction2:SetGradient("VERTICAL", getColor(r2, g2, b2, a), getColor(r, g, b, a))
+            setFillVertexColor(myHealPrediction2, r, g, b, a)
         end
 
         r, g, b, a, r2, g2, b2 = unpack(colors[colorPalette[3]])
@@ -524,7 +523,11 @@ local function updateHealPrediction(frame, unit, cutoff, gradient, colorPalette,
         if a == 0 then
             otherIncomingHeal1 = 0
         else
-            otherHealPrediction1:SetGradient("VERTICAL", getColor(r2, g2, b2, a), getColor(r, g, b, a))
+            -- Same base-texture-collision fix as myHealPrediction1 above.
+            if otherHealPrediction1.SetColorTexture then
+                otherHealPrediction1:SetColorTexture(1, 1, 1)
+            end
+            setFillVertexColor(otherHealPrediction1, r, g, b, a)
         end
 
         r, g, b, a, r2, g2, b2 = unpack(colors[colorPalette[4]])
@@ -532,7 +535,7 @@ local function updateHealPrediction(frame, unit, cutoff, gradient, colorPalette,
         if a == 0 then
             otherIncomingHeal2 = 0
         else
-            otherHealPrediction2:SetGradient("VERTICAL", getColor(r2, g2, b2, a), getColor(r, g, b, a))
+            setFillVertexColor(otherHealPrediction2, r, g, b, a)
         end
     else
 		-- ... gradient is false: player/target/pet frame/party frames (non raid style) and name plates
@@ -2392,6 +2395,96 @@ function ClassicHealPredictionFrame_OnLoad(self)
         end
     )
 
+    -- Set before the do-block below so commit()'s closure captures this local
+    -- (not a same-named global) - and before ColorPickerFrame:SetupColorPickerAndShow()
+    -- further down, so the manual R/G/B/A entry boxes know which swatch's
+    -- applyColor to call. They can't rely on swatchFunc/opacityFunc since those
+    -- only fire from Blizzard's own wheel/slider drag scripts, not from
+    -- programmatic ColorPickerFrame:SetColorRGB()/SetColorAlpha() calls.
+    local activeApplyColor
+
+    -- Manual R/G/B/A entry (0-255) on Blizzard's color picker, in addition to
+    -- the wheel/sliders - standard in most color pickers, this one doesn't
+    -- have it natively. Created once, before the swatch loop below, so
+    -- onColorChanged/onCancel (defined per swatch) can keep it in sync.
+    -- R/G/B only - alpha deliberately excluded: ColorPickerFrame's opacity
+    -- slider periodically re-fires its callback with a stale internal value
+    -- on its own (confirmed live, unrelated to anything this addon does),
+    -- clobbering any typed alpha shortly after. Dragging the opacity slider
+    -- by hand is good enough; getting an exact RGB hue from the wheel is the
+    -- part manual entry is actually needed for.
+    local refreshColorPickerEditBoxes
+    do
+        local editBoxes = {}
+
+        -- Grow the picker frame itself so this row fits inside its own
+        -- backdrop instead of spilling into whatever sits below it in the
+        -- options panel. Anchored above the bottom edge to leave room for
+        -- Blizzard's own Okay/Cancel buttons, which sit at the very bottom.
+        ColorPickerFrame:SetHeight(ColorPickerFrame:GetHeight() + 40)
+
+        local container = CreateFrame("Frame", nil, ColorPickerFrame)
+        container:SetPoint("BOTTOM", ColorPickerFrame, "BOTTOM", 0, 30)
+        container:SetSize(165, 24)
+
+        local function commit(channel, editBox)
+            local value = tonumber(editBox:GetText())
+            editBox:ClearFocus()
+
+            if not value or not activeApplyColor then
+                return
+            end
+
+            value = max(0, min(255, value)) / 255
+
+            local r, g, b = ColorPickerFrame:GetColorRGB()
+            local a = ColorPickerFrame:GetColorAlpha()
+
+            if channel == "R" then
+                r = value
+            elseif channel == "G" then
+                g = value
+            else
+                b = value
+            end
+
+            ColorPickerFrame:SetColorRGB(r, g, b)
+            activeApplyColor(r, g, b, a)
+
+            -- Display exactly what we just applied rather than re-querying
+            -- ColorPickerFrame:GetColorRGB() to sidestep any similar staleness.
+            editBoxes.R:SetText(tostring(floor(r * 255 + 0.5)))
+            editBoxes.G:SetText(tostring(floor(g * 255 + 0.5)))
+            editBoxes.B:SetText(tostring(floor(b * 255 + 0.5)))
+        end
+
+        for i, channel in ipairs({"R", "G", "B"}) do
+            local label = container:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            label:SetText(channel)
+            label:SetPoint("LEFT", container, "LEFT", (i - 1) * 55, 0)
+
+            local editBox = CreateFrame("EditBox", nil, container, "InputBoxTemplate")
+            editBox:SetSize(32, 20)
+            editBox:SetAutoFocus(false)
+            editBox:SetMaxLetters(3)
+            editBox:SetPoint("LEFT", label, "RIGHT", 4, 0)
+            editBox:SetScript("OnEnterPressed", function(self) commit(channel, self) end)
+            editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+
+            editBoxes[channel] = editBox
+        end
+
+        function refreshColorPickerEditBoxes()
+            local r, g, b = ColorPickerFrame:GetColorRGB()
+
+            editBoxes.R:SetText(tostring(floor(r * 255 + 0.5)))
+            editBoxes.G:SetText(tostring(floor(g * 255 + 0.5)))
+            editBoxes.B:SetText(tostring(floor(b * 255 + 0.5)))
+        end
+
+        ColorPickerFrame:HookScript("OnShow", refreshColorPickerEditBoxes)
+    end
+
     for k, x in ipairs(
         {
             {"Raid Frames: My healing", {1, 2, 3, 4}},
@@ -2430,7 +2523,13 @@ function ClassicHealPredictionFrame_OnLoad(self)
 
             local function applyColor(newR, newG, newB, newA)
                 colorSwatch:GetNormalTexture():SetVertexColor(newR, newG, newB, newA)
-                ClassicHealPredictionSettings.colors[colorSwatch.index] = {gradient(newR, newG, newB, newA)}
+
+                local newColor = {gradient(newR, newG, newB, newA)}
+                ClassicHealPredictionSettings.colors[colorSwatch.index] = newColor
+                -- Also write straight to the persisted SavedVariables - relying on
+                -- the panel's Okay/Cancel staging flow means an immediate /reload
+                -- (or just never clicking Okay) silently discards the change.
+                _G.ClassicHealPredictionSettings.colors[colorSwatch.index] = deepcopy(newColor)
 
                 updateAllFrames()
             end
@@ -2439,17 +2538,20 @@ function ClassicHealPredictionFrame_OnLoad(self)
                 local newR, newG, newB = ColorPickerFrame:GetColorRGB()
                 local newA = ColorPickerFrame:GetColorAlpha()
                 applyColor(newR, newG, newB, newA)
+                refreshColorPickerEditBoxes()
             end
 
             local function onCancel()
                 local newR, newG, newB, newA = ColorPickerFrame:GetPreviousValues()
                 applyColor(newR, newG, newB, newA)
+                refreshColorPickerEditBoxes()
             end
 
             colorSwatch:SetScript(
                 "OnClick",
                 function(self)
                     local r, g, b, a = unpack(ClassicHealPredictionSettings.colors[colorSwatch.index])
+                    activeApplyColor = applyColor
                     -- ORIGINAL: set ColorPickerFrame.func/.opacityFunc/.cancelFunc/.hasOpacity/
                     -- .opacity/.previousValues directly, then :SetColorRGB() + :Hide() + :Show().
                     -- That API is gone as of the shared Retail/Classic UI codebase - the color
@@ -2495,11 +2597,11 @@ function ClassicHealPredictionFrame_OnLoad(self)
                         elseif positionInGroup == 3 then
                             GameTooltip:AddLine("Immediate incoming heal (overheal warning color).", nil, nil, nil, true)
                             GameTooltip:AddLine(" ")
-                            GameTooltip:AddLine("Same value as the 1st color, shown instead when the total predicted heal would overheal past your Overheal Threshold setting.", nil, nil, nil, true)
+                            GameTooltip:AddLine("Same value as the 1st color, shown instead when the total predicted heal (yours plus everyone else's, combined) would overheal past the \"Use different colors if overhealing exceeds ... percent of max health\" setting below. Only applies if that setting's checkbox is enabled - the whole bar swaps to this color set at once, not just the overhealing portion.", nil, nil, nil, true)
                         else
                             GameTooltip:AddLine("Remaining incoming heal (overheal warning color).", nil, nil, nil, true)
                             GameTooltip:AddLine(" ")
-                            GameTooltip:AddLine("Same value as the 2nd color, shown instead when the total predicted heal would overheal past your Overheal Threshold setting.", nil, nil, nil, true)
+                            GameTooltip:AddLine("Same value as the 2nd color, shown instead when the total predicted heal (yours plus everyone else's, combined) would overheal past the \"Use different colors if overhealing exceeds ... percent of max health\" setting below. Only applies if that setting's checkbox is enabled - the whole bar swaps to this color set at once, not just the overhealing portion.", nil, nil, nil, true)
                         end
                     elseif positionInGroup == 1 then
                         GameTooltip:AddLine("Immediate incoming heal.", nil, nil, nil, true)
@@ -2507,8 +2609,12 @@ function ClassicHealPredictionFrame_OnLoad(self)
                         GameTooltip:AddLine("Remaining incoming heal.", nil, nil, nil, true)
                     elseif positionInGroup == 3 then
                         GameTooltip:AddLine("Immediate incoming heal (overheal warning color).", nil, nil, nil, true)
+                        GameTooltip:AddLine(" ")
+                        GameTooltip:AddLine("Only used if \"Use different colors if overhealing exceeds ... percent of max health\" is enabled below - swaps the whole bar, not just the overhealing part.", nil, nil, nil, true)
                     else
                         GameTooltip:AddLine("Remaining incoming heal (overheal warning color).", nil, nil, nil, true)
+                        GameTooltip:AddLine(" ")
+                        GameTooltip:AddLine("Only used if \"Use different colors if overhealing exceeds ... percent of max health\" is enabled below - swaps the whole bar, not just the overhealing part.", nil, nil, nil, true)
                     end
 
                     GameTooltip:Show()
