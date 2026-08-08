@@ -45,7 +45,21 @@ local ADDON_VERSION = string.match(metaData or "", "^v(%d+%.%d+%.%d+)$")
 if not ADDON_VERSION then
     ADDON_VERSION = "Local Dev Build"
 end
-ChatFrame1:AddMessage("Loading " .. ADDON_NAME .. "(" .. ADDON_VERSION .. ")" .. " test version for WoW Classic Era Patch 1.15.9.", 0.85, 0.82, 0.0)
+-- Read the client type/interface version live instead of hardcoding a patch
+-- string (e.g. "Classic Era Patch 1.15.9") - that goes stale on every client
+-- update, and was also just flatly wrong when loaded under TBC Classic.
+local clientName = "WoW Classic"
+if WOW_PROJECT_ID == WOW_PROJECT_BURNING_CRUSADE_CLASSIC then
+    clientName = "WoW Classic (Burning Crusade)"
+elseif WOW_PROJECT_ID == WOW_PROJECT_CLASSIC then
+    clientName = "WoW Classic Era"
+end
+-- Interface numbers encode as MAJOR*10000 + MINOR*100 + PATCH, e.g. 11509 =
+-- 1.15.9, 20506 = 2.5.6 - decode instead of hardcoding a patch string per
+-- client, which goes stale on every update.
+local interfaceVersion = select(4, GetBuildInfo())
+local patchVersion = string.format("%d.%d.%d", floor(interfaceVersion / 10000), floor((interfaceVersion % 10000) / 100), interfaceVersion % 100)
+ChatFrame1:AddMessage("Loading " .. ADDON_NAME .. "(" .. ADDON_VERSION .. ")" .. " for " .. clientName .. " patch " .. patchVersion .. ".", 0.85, 0.82, 0.0)
 
 local HealComm = LibStub("LibHealComm-4.0")
 local HealComm_OVERTIME_HEALS = bit.bor(HealComm.HOT_HEALS, HealComm.CHANNEL_HEALS)

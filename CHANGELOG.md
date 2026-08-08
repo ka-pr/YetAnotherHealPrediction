@@ -1,5 +1,10 @@
 # Changelog
 
+## v3.0.5
+
+- Updated TBC Classic support to the current client version, confirmed working with no known issues.
+- Fixed the login message showing the wrong patch number (and wrong game version entirely on TBC Classic) - it now reads the actual running client instead of a hardcoded string.
+
 ## v3.0.4
 
 - Fixed raid and party frame heal prediction colors rendering wrong (e.g. red appearing black, yellow appearing green) instead of the color set in settings.

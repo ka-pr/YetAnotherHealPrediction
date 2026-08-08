@@ -1,4 +1,4 @@
-## Interface: 20504
+## Interface: 20506
 ## Title: YetAnotherHealPrediction
 ## Notes: Adds heal prediction to the Blizzard unit/raid frames and nameplates
 ## Version: @project-version@
