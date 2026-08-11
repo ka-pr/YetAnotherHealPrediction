@@ -1,5 +1,9 @@
 # Changelog
 
+## v3.0.6
+
+- Updated the bundled ChatThrottleLib to the current version.
+
 ## v3.0.5
 
 - Updated TBC Classic support to the current client version, confirmed working with no known issues.
